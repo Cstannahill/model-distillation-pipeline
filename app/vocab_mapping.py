@@ -2,6 +2,7 @@ import torch
 from transformers import PreTrainedTokenizer
 from typing import Dict, List
 from tqdm import tqdm
+from .vocab_mapping_store import save_vocab_mapping
 
 
 def build_vocab_mapping(student_tokenizer, teacher_tokenizer, partial_mapping=None):
@@ -12,7 +13,10 @@ def build_vocab_mapping(student_tokenizer, teacher_tokenizer, partial_mapping=No
     missing_ids = [
         sid for sid in range(student_tokenizer.vocab_size) if sid not in mapping
     ]
-    for student_id in tqdm(missing_ids, desc="Student tokens (missing only)"):
+    chunk_size = 1000
+    for i, student_id in enumerate(
+        tqdm(missing_ids, desc="Student tokens (missing only)")
+    ):
         try:
             token_str = student_tokenizer.decode([student_id], skip_special_tokens=True)
         except Exception:
@@ -33,6 +37,15 @@ def build_vocab_mapping(student_tokenizer, teacher_tokenizer, partial_mapping=No
                 teacher_ids.append(teacher_id)
         if teacher_ids:
             mapping[student_id] = teacher_ids
+        # Save progress every chunk_size tokens
+        if (i + 1) % chunk_size == 0:
+            save_vocab_mapping(
+                mapping, student_tokenizer, teacher_tokenizer, chunk_size=chunk_size
+            )
+    # Final save after all tokens
+    save_vocab_mapping(
+        mapping, student_tokenizer, teacher_tokenizer, chunk_size=chunk_size
+    )
     print(
         f"Mapped {len(mapping)} out of {student_tokenizer.vocab_size} student tokens."
     )
@@ -52,7 +65,15 @@ def map_teacher_probs_to_student(
     student_probs = torch.zeros(
         (batch, seq, student_vocab_size), device=teacher_probs.device
     )
+    mapped_ids = set(vocab_mapping.keys())
+    unmapped_ids = set(range(student_vocab_size)) - mapped_ids
     for student_id, teacher_ids in vocab_mapping.items():
         # Sum teacher probabilities for all teacher tokens that map to this student token
         student_probs[..., student_id] = teacher_probs[..., teacher_ids].sum(dim=-1)
+    # Assign small uniform probability to unmapped tokens
+    if unmapped_ids:
+        student_probs[..., list(unmapped_ids)] = 1e-8
+    # Normalize so probabilities sum to 1 for each position
+    sum_probs = student_probs.sum(dim=-1, keepdim=True)
+    student_probs = student_probs / (sum_probs + 1e-8)
     return student_probs

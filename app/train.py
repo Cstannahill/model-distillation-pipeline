@@ -16,7 +16,7 @@ dataset = load_dataset(
     "bigcode/the-stack",
     data_dir="data/python",
     data_files="train-00000-of-00206.parquet",
-    split="train[:1%]",
+    split="train[:50]",
 )  # small sample
 print("Dataset loaded.")
 
