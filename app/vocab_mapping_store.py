@@ -1,8 +1,14 @@
+# vocab_mapping_store.py
 import os
 import json
-import hashlib
+import math
+import time
+from typing import Dict, List, Optional
+
+from .distilldb import init_db, save_chunk  # uses your existing DB helper
 
 
+# keep same get_mapping_path signature as before so other code doesn't change
 def get_mapping_path(
     student_tokenizer,
     teacher_tokenizer,
@@ -15,147 +21,110 @@ def get_mapping_path(
         teacher_tokenizer, "name_or_path", str(type(teacher_tokenizer))
     )
     key = f"{student_name}|{teacher_name}"
+    # short stable hash so filename isn't huge
+    import hashlib
+
     key_hash = hashlib.sha256(key.encode()).hexdigest()[:16]
     filename = f"vocab_mapping_{key_hash}.json"
     return os.path.join(dir_path, filename)
 
 
-def save_vocab_mapping(mapping, student_tokenizer, teacher_tokenizer, chunk_size=1000):
-    import shutil
-    import time
+# atomic JSON writer (fsync + atomic replace)
+def atomic_json_write(path: str, data) -> None:
+    dirpath = os.path.dirname(path) or "."
+    tmp = os.path.join(dirpath, os.path.basename(path) + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
+
+def save_vocab_mapping(
+    mapping: Dict[int, List[int]],
+    student_tokenizer,
+    teacher_tokenizer,
+    chunk_size: int = 1000,
+):
+    """
+    Lightweight JSON export of the full mapping (for human-readable snapshot).
+    Prefer the DB as the source of truth; this is optional / used as a final snapshot.
+    """
     path = get_mapping_path(student_tokenizer, teacher_tokenizer)
-    keys = list(mapping.keys())
-    total = len(keys)
-    temp_path = path + ".tmp"
-    backup_dir = os.path.join(os.path.dirname(path), "vocab_mapping_backups")
-    os.makedirs(backup_dir, exist_ok=True)
-    # Backup original file if it exists and not already backed up
-    if os.path.exists(path) and not os.path.exists(
-        os.path.join(backup_dir, os.path.basename(path) + ".orig.bak")
-    ):
-        shutil.copy2(
-            path, os.path.join(backup_dir, os.path.basename(path) + ".orig.bak")
-        )
-        print(f"[LOG] Original backup created: {os.path.basename(path)}.orig.bak")
-    written = 0
+    # Convert keys to str for JSON
+    out = {str(k): v for k, v in mapping.items()}
+    atomic_json_write(path, out)
+    return path
+
+
+def load_vocab_mapping(
+    student_tokenizer, teacher_tokenizer
+) -> Optional[Dict[int, List[int]]]:
+    """
+    Read the JSON snapshot if it exists. Return mapping with integer keys.
+    Note: DB is still preferred for resume.
+    """
+    path = get_mapping_path(student_tokenizer, teacher_tokenizer)
+    if not os.path.exists(path):
+        return None
     try:
-        with open(temp_path, "w") as f:
-            f.write("{")
-            for i, k in enumerate(keys):
-                entry = f'"{k}": {json.dumps(mapping[k])}'
-                if i > 0:
-                    f.write(",")
-                f.write(entry)
-                written += 1
-                # Flush every chunk_size entries
-                if written % chunk_size == 0:
-                    f.flush()
-                # Versioned backup every 1000 tokens
-                if written % 1000 == 0:
-                    ts = int(time.time())
-                    backup_path = os.path.join(
-                        backup_dir, f"{os.path.basename(path)}.{written}.{ts}.bak"
-                    )
-                    try:
-                        shutil.copy2(temp_path, backup_path)
-                        print(f"[LOG] Backup saved to {backup_path}")
-                        # Keep only 3 most recent backups (plus original)
-                        backups = sorted(
-                            [
-                                f
-                                for f in os.listdir(backup_dir)
-                                if f.startswith(os.path.basename(path) + ".")
-                                and f.endswith(".bak")
-                                and not f.endswith(".orig.bak")
-                            ],
-                            reverse=True,
-                        )
-                        if len(backups) > 3:
-                            for old_bak in backups[3:]:
-                                try:
-                                    os.remove(os.path.join(backup_dir, old_bak))
-                                    print(f"[LOG] Deleted old backup: {old_bak}")
-                                except Exception as e:
-                                    print(
-                                        f"[ERROR] Failed to delete backup {old_bak}: {e}"
-                                    )
-                    except Exception as e:
-                        print(f"[ERROR] Backup error: {e}")
-            f.write("}")
-        os.replace(temp_path, path)
-        print(
-            f"[LOG] Saved vocab mapping to {path} in {((total-1)//chunk_size)+1} chunks."
-        )
-        # Integrity check: reload and compare key sets
-        try:
-            with open(path, "r") as f:
-                loaded = json.load(f)
-            loaded_keys = set(loaded.keys())
-            mem_keys = set(str(k) for k in mapping.keys())
-            if loaded_keys == mem_keys:
-                print(f"[LOG] Integrity check passed: {len(loaded_keys)} keys.")
-            else:
-                print(
-                    f"[WARN] Integrity check failed: {len(loaded_keys)} loaded vs {len(mem_keys)} in memory."
-                )
-        except Exception as e:
-            print(f"[ERROR] Integrity check failed: {e}")
+        with open(path, "r", encoding="utf-8") as f:
+            m = json.load(f)
+        return {int(k): v for k, v in m.items()}
     except Exception as e:
-        print(f"[ERROR] Error saving vocab mapping: {e}")
+        # corrupted file — warn and return None
+        print(f"[WARN] Failed to load JSON mapping {path}: {e}")
+        return None
 
 
-def load_vocab_mapping(student_tokenizer, teacher_tokenizer):
-    import glob
+# -----------------------
+# Migration helpers
+# -----------------------
 
-    path = get_mapping_path(student_tokenizer, teacher_tokenizer)
-    backup_dir = os.path.join(os.path.dirname(path), "vocab_mapping_backups")
 
-    def safe_merge(map1, map2):
-        # Prefer the mapping with more keys
-        if map1 is None:
-            return map2
-        if map2 is None:
-            return map1
-        return map1 if len(map1) >= len(map2) else map2
+def import_json_to_db(json_path: str, db_path: str, batch_size: int = 1000):
+    """
+    Import a big JSON mapping into the sqlite DB in batches.
+    This will call init_db(db_path) and then use distilldb.save_chunk to upsert in transactions.
+    """
+    if not os.path.exists(json_path):
+        raise FileNotFoundError(json_path)
+    with open(json_path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    mapping = {int(k): v for k, v in raw.items()}
 
-    mapping = None
-    if os.path.exists(path):
-        try:
-            with open(path, "r") as f:
-                mapping = json.load(f)
-            print(f"[LOG] Loaded vocab mapping from {path}")
-            mapping = {int(k): v for k, v in mapping.items()}
-        except Exception as e:
-            print(f"[ERROR] Error loading vocab mapping: {e}")
-    # Try to restore from original backup if main file is corrupted or incomplete
-    orig_backup = os.path.join(backup_dir, os.path.basename(path) + ".orig.bak")
-    if os.path.exists(orig_backup):
-        try:
-            with open(orig_backup, "r") as f:
-                backup_mapping = json.load(f)
-            print(f"[LOG] Restored vocab mapping from backup {orig_backup}")
-            backup_mapping = {int(k): v for k, v in backup_mapping.items()}
-            mapping = safe_merge(mapping, backup_mapping)
-        except Exception as e2:
-            print(f"[ERROR] Backup restore failed: {e2}")
-    # Try to restore from most recent versioned backup if still incomplete
-    versioned_backups = sorted(
-        glob.glob(os.path.join(backup_dir, f"{os.path.basename(path)}.*.bak")),
-        reverse=True,
+    init_db(db_path)
+
+    # do batched upserts using save_chunk (atomic per batch)
+    student_ids = sorted(mapping.keys())
+    total = len(student_ids)
+    for i in range(0, total, batch_size):
+        batch_ids = student_ids[i : i + batch_size]
+        chunk = {sid: mapping[sid] for sid in batch_ids}
+        last_processed_sid = batch_ids[-1]
+        save_chunk(db_path, chunk, last_processed_sid)
+        print(
+            f"[LOG] Imported batch {i//batch_size + 1} / {math.ceil(total/batch_size)} up to {last_processed_sid}"
+        )
+
+    print(f"[LOG] Imported {total} mappings from {json_path} -> {db_path}")
+
+
+def find_latest_backup_json(backups_dir: str, base_filename: str) -> Optional[str]:
+    """
+    If you still kept the old backup folder, use this to pick the latest .bak JSON
+    (you used to name files like 'vocab_mapping_<hash>.json.<count>.<ts>.bak').
+    """
+    if not os.path.isdir(backups_dir):
+        return None
+    candidates = []
+    for fn in os.listdir(backups_dir):
+        if fn.startswith(base_filename) and fn.endswith(".bak"):
+            candidates.append(fn)
+    if not candidates:
+        return None
+    # sort by mtime of the backup file
+    candidates.sort(
+        key=lambda x: os.path.getmtime(os.path.join(backups_dir, x)), reverse=True
     )
-    for backup_path in versioned_backups:
-        try:
-            with open(backup_path, "r") as f:
-                backup_mapping = json.load(f)
-            print(f"[LOG] Restored vocab mapping from backup {backup_path}")
-            backup_mapping = {int(k): v for k, v in backup_mapping.items()}
-            mapping = safe_merge(mapping, backup_mapping)
-            break
-        except Exception as e3:
-            print(f"[ERROR] Versioned backup restore failed: {e3}")
-    if mapping is not None:
-        print(f"[LOG] Final vocab mapping loaded with {len(mapping)} keys.")
-        return mapping
-    print(f"[ERROR] No valid vocab mapping found.")
-    return None
+    return os.path.join(backups_dir, candidates[0])

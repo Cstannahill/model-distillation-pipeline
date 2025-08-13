@@ -48,25 +48,10 @@ alpha = 0.9  # weight for soft loss
 beta = 0.1  # weight for hard loss
 
 
-print("Checking for cached vocab mapping...")
-vocab_mapping = load_vocab_mapping(student_tokenizer, teacher_tokenizer)
-if vocab_mapping is None:
-    print("No cached mapping found. Building vocab mapping...")
-    vocab_mapping = build_vocab_mapping(student_tokenizer, teacher_tokenizer)
-    save_vocab_mapping(vocab_mapping, student_tokenizer, teacher_tokenizer)
-else:
-    print("Using cached vocab mapping. Checking for missing tokens...")
-    updated_mapping = build_vocab_mapping(
-        student_tokenizer, teacher_tokenizer, partial_mapping=vocab_mapping
-    )
-    if len(updated_mapping) > len(vocab_mapping):
-        print(
-            f"Added {len(updated_mapping) - len(vocab_mapping)} new mappings. Saving updated mapping."
-        )
-        save_vocab_mapping(updated_mapping, student_tokenizer, teacher_tokenizer)
-    vocab_mapping = updated_mapping
+vocab_mapping = build_vocab_mapping(student_tokenizer, teacher_tokenizer)
+save_vocab_mapping(vocab_mapping, student_tokenizer, teacher_tokenizer, chunk_size=100)
 student_vocab_size = student_tokenizer.vocab_size
-print("Vocab mapping ready.")
+
 print(f"Vocab mapping size: {len(vocab_mapping)}")
 
 print("Starting training loop...")
