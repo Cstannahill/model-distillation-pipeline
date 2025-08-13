@@ -2,7 +2,7 @@ import torch
 from transformers import PreTrainedTokenizer
 from typing import Dict, List
 from tqdm import tqdm
-from .vocab_mapping_store import save_vocab_mapping
+from .vocab_mapping_store import save_vocab_mapping, load_vocab_mapping
 
 
 def build_vocab_mapping(student_tokenizer, teacher_tokenizer, partial_mapping=None):
@@ -42,10 +42,17 @@ def build_vocab_mapping(student_tokenizer, teacher_tokenizer, partial_mapping=No
             save_vocab_mapping(
                 mapping, student_tokenizer, teacher_tokenizer, chunk_size=chunk_size
             )
+            # Reload and merge mapping from disk to ensure progress is not lost
+            disk_mapping = load_vocab_mapping(student_tokenizer, teacher_tokenizer)
+            if disk_mapping:
+                mapping.update(disk_mapping)
     # Final save after all tokens
     save_vocab_mapping(
         mapping, student_tokenizer, teacher_tokenizer, chunk_size=chunk_size
     )
+    disk_mapping = load_vocab_mapping(student_tokenizer, teacher_tokenizer)
+    if disk_mapping:
+        mapping.update(disk_mapping)
     print(
         f"Mapped {len(mapping)} out of {student_tokenizer.vocab_size} student tokens."
     )
