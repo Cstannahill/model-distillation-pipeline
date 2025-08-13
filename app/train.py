@@ -2,18 +2,21 @@ import torch
 import torch.nn.functional as F
 from typing import cast
 from torch.utils.data import DataLoader, Dataset as TorchDataset
-from datasets import load_dataset
+from datasets import load_dataset, get_dataset_split_names
 from transformers import DataCollatorWithPadding
 from .models import teacher_tokenizer, teacher, student_tokenizer, student, device
 from .vocab_mapping import build_vocab_mapping, map_teacher_probs_to_student
 from .vocab_mapping_store import load_vocab_mapping, save_vocab_mapping
+from tqdm import tqdm
 
+datasplit = get_dataset_split_names("bigcode/the-stack", data_dir="data/python")
+print(datasplit)
 print("Loading dataset...")
 dataset = load_dataset(
     "bigcode/the-stack",
     data_dir="data/python",
     data_files="train-00000-of-00206.parquet",
-    split="train[:10000]",
+    split="train[:1%]",
 )  # small sample
 print("Dataset loaded.")
 
@@ -52,40 +55,54 @@ if vocab_mapping is None:
     vocab_mapping = build_vocab_mapping(student_tokenizer, teacher_tokenizer)
     save_vocab_mapping(vocab_mapping, student_tokenizer, teacher_tokenizer)
 else:
-    print("Using cached vocab mapping.")
+    print("Using cached vocab mapping. Checking for missing tokens...")
+    updated_mapping = build_vocab_mapping(
+        student_tokenizer, teacher_tokenizer, partial_mapping=vocab_mapping
+    )
+    if len(updated_mapping) > len(vocab_mapping):
+        print(
+            f"Added {len(updated_mapping) - len(vocab_mapping)} new mappings. Saving updated mapping."
+        )
+        save_vocab_mapping(updated_mapping, student_tokenizer, teacher_tokenizer)
+    vocab_mapping = updated_mapping
 student_vocab_size = student_tokenizer.vocab_size
 print("Vocab mapping ready.")
+print(f"Vocab mapping size: {len(vocab_mapping)}")
 
 print("Starting training loop...")
 for epoch in range(1):
     print(f"Epoch {epoch+1}...")
-    for batch_idx, batch in enumerate(dataloader):
-        print(f"Batch {batch_idx+1}: Moving input to device...")
+    for batch_idx, batch in enumerate(tqdm(dataloader, desc="Training batches")):
         input_ids = batch["input_ids"].to(device)
 
-        print("Running teacher model...")
         with torch.no_grad():
             teacher_logits = teacher(input_ids).logits  # [B, L, teacher_vocab]
-        print("Calculating teacher probabilities...")
         teacher_probs = torch.nn.functional.softmax(teacher_logits / T, dim=-1)
-        print("Mapping teacher probabilities to student vocab...")
         mapped_teacher_probs = map_teacher_probs_to_student(
             teacher_probs, vocab_mapping, student_vocab_size
         )
-        print("Calculating teacher log probabilities...")
+        # Diagnostic prints
+        print(
+            f"Batch {batch_idx}: mapped_teacher_probs shape: {mapped_teacher_probs.shape}"
+        )
+        print(
+            f"Batch {batch_idx}: mapped_teacher_probs min: {mapped_teacher_probs.min().item()}, max: {mapped_teacher_probs.max().item()}"
+        )
+        print(
+            f"Batch {batch_idx}: mapped_teacher_probs contains NaN: {torch.isnan(mapped_teacher_probs).any().item()}"
+        )
+        print(
+            f"Batch {batch_idx}: mapped_teacher_probs contains zeros: {(mapped_teacher_probs == 0).sum().item()} out of {mapped_teacher_probs.numel()}"
+        )
         teacher_log_probs = torch.log(mapped_teacher_probs + 1e-8)  # avoid log(0)
 
-        print("Running student model...")
         student_logits = student(input_ids).logits  # [B, L, student_vocab]
-        print("Calculating student log probabilities...")
         student_log_probs = F.log_softmax(student_logits / T, dim=-1)
 
-        print("Calculating soft loss...")
         loss_soft = F.kl_div(
             student_log_probs, teacher_log_probs, reduction="batchmean"
         ) * (T * T)
 
-        print("Calculating hard loss...")
         target_ids = input_ids[:, 1:].contiguous()
         student_preds = student_logits[:, :-1, :].contiguous()
         loss_hard = F.cross_entropy(
@@ -94,10 +111,8 @@ for epoch in range(1):
             ignore_index=teacher_tokenizer.pad_token_id,
         )
 
-        print("Combining losses...")
         loss = alpha * loss_soft + beta * loss_hard
 
-        print("Optimizing...")
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()

@@ -4,9 +4,15 @@ from typing import Dict, List
 from tqdm import tqdm
 
 
-def build_vocab_mapping(student_tokenizer, teacher_tokenizer):
-    mapping = {}
-    for student_id in tqdm(range(student_tokenizer.vocab_size), desc="Student tokens"):
+def build_vocab_mapping(student_tokenizer, teacher_tokenizer, partial_mapping=None):
+    if partial_mapping is None:
+        mapping = {}
+    else:
+        mapping = dict(partial_mapping)
+    missing_ids = [
+        sid for sid in range(student_tokenizer.vocab_size) if sid not in mapping
+    ]
+    for student_id in tqdm(missing_ids, desc="Student tokens (missing only)"):
         try:
             token_str = student_tokenizer.decode([student_id], skip_special_tokens=True)
         except Exception:
